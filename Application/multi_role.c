@@ -52,7 +52,9 @@
 #include "gapgattserver.h"
 #include "gattservapp.h"
 
-//#include "bsp_i2c.h"
+#include "bsp_i2c.h"
+#include "bsp_spi.h"
+//#include "sensor.h"
 
 #include "multi.h"
 #include "gapbondmgr.h"
@@ -62,7 +64,6 @@
 
 #include "util.h"
 #include "Board.h"
-//#include "sensor.h"
 
 #include "linkdb.h"
 #include "multi_role.h"
@@ -260,16 +261,16 @@ static uint8 advertData[31] = {
 //};
 
 // Pins that are actively used by the application
-//static PIN_Config SensortagAppPinTable[] =
-//{
-//    Board_LED1       | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,     /* LED initially off             */
-//    Board_LED2       | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,     /* LED initially off             */
-//    PIN_TERMINATE
-//};
+static PIN_Config SensortagAppPinTable[] =
+{
+    Board_LED1       | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,     /* LED initially off             */
+    Board_LED2       | PIN_GPIO_OUTPUT_EN | PIN_GPIO_LOW | PIN_PUSHPULL | PIN_DRVSTR_MAX,     /* LED initially off             */
+    PIN_TERMINATE
+};
 
 // Global pin resources
-//PIN_State pinGpioState;
-//PIN_Handle hGpioPin;
+PIN_State pinGpioState;
+PIN_Handle hGpioPin;
 
 // Scanning state
 static bool scanningStarted = FALSE;
@@ -349,10 +350,10 @@ void SimpleTopology_createTask(void)
 static void simpleTopology_init(void)
 {
 	// Setup I2C for sensors
-	//bspI2cInit();
+	bspI2cInit();
 
 	// Handling of buttons, LED, relay
-	//hGpioPin = PIN_open(&pinGpioState, SensortagAppPinTable);
+	hGpioPin = PIN_open(&pinGpioState, SensortagAppPinTable);
 
 	// ******************************************************************
 	// N0 STACK API CALLS CAN OCCUR BEFORE THIS CALL TO ICall_registerApp
