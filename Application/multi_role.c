@@ -123,6 +123,9 @@
 
 #define SNV_BASE_ID							  0x80
 
+// the maximum number of recent neighbors to keep
+#define RECENT_LIST_MAX_SIZE				  3
+
 
 
 /*********************************************************************
@@ -146,12 +149,18 @@ typedef struct
 } sbtEvt_t;
 
 typedef struct {
-	gapDevRec_t devRec;
+	uint8 mac[B_ADDR_LEN]; //!< Device's Address
 	uint8 advDataLen;
 	uint8 advData[31];
 	uint32 lastContactTicks;
 	uint8 rssi;
 } myGapDevRec_t;
+
+// define list for storing discovered RUTh neighbors
+typedef struct listNode {
+	myGapDevRec_t device;
+	struct listNode *next;
+} listNode_t;
 
 /*********************************************************************
  * LOCAL VARIABLES
@@ -175,6 +184,11 @@ Task_Struct sbmTask;
 Char sbmTaskStack[SBT_TASK_STACK_SIZE];
 
 static RUThNodeState_t nodeState = SLEEPING;
+
+// head of the list of discovered peers
+static listNode_t* neighborListHeadPtr = NULL;
+//list of the three most recently updated neighbors
+static listNode_t* mostRecentNeighborsPtr = NULL;
 
 static uint8 advertData[31] = {
 
@@ -295,9 +309,19 @@ static void simpleTopology_processRoleEvent(gapMultiRoleEvent_t *pEvent);
 static uint8_t simpleTopology_enqueueMsg(uint16_t event, uint8_t status, uint8_t *pData);
 static uint8_t simpleTopology_eventCB(gapMultiRoleEvent_t *pEvent);
 static void SensorTagMultiRoleTest_scanStartHandler(UArg arg);
-static bool isRUThNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent_a);
 
 static uint8 memcomp(uint8 * str1, uint8 * str2, uint8 len);
+
+static bool RUTh_isRUThNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent_a);
+static bool RUTh_isInNeighborList(gapDeviceInfoEvent_t *gapDeviceInfoEvent);
+static listNode_t* RUTh_getNeighbor(uint8 *addr);
+static listNode_t* RUTh_addNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent);
+static uint8 RUTh_countNeighbors();
+static void RUTh_updateDiscoveryTime(gapDeviceInfoEvent_t *gapDeviceInfoEvent);
+static listNode_t* RUTh_addMostRecentNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent);
+static void RUTh_updateAdvertData();
+static void RUTh_processAdvertisement(gapMultiRoleEvent_t *pEvent);
+
 
 /*********************************************************************
  * PROFILE CALLBACKS
@@ -599,7 +623,13 @@ static void simpleTopology_processRoleEvent(gapMultiRoleEvent_t *pEvent)
 		// discovery complete
 		scanningStarted = FALSE;
 		IntMasterDisable();
-		System_printf("Done Scanning. Starting Advertising!\n");
+		System_printf("Done Scanning.\n");
+		System_printf("I've discovered %d nodes to date.\n", RUTh_countNeighbors());
+		System_printf("Starting Advertising!\n");
+
+
+		RUTh_updateAdvertData();
+
 		IntMasterEnable();
 
 
@@ -616,13 +646,8 @@ static void simpleTopology_processRoleEvent(gapMultiRoleEvent_t *pEvent)
 
 			IntMasterDisable();
 			System_printf("Received advertisement!\n");
-			System_printf("Address: ");
-			System_printf(Util_convertBdAddr2Str(pEvent->deviceInfo.addr));
-			System_printf("\n");
-			System_printf("Checking if it is a RUTh node.\n");
-			if(isRUThNode((gapDeviceInfoEvent_t*) &pEvent->deviceInfo)){
-				System_printf("RUTh Node!\n");
-			}
+			RUTh_processAdvertisement(pEvent);
+
 			IntMasterEnable();
 		}
 	}
@@ -699,7 +724,7 @@ static void SensorTagMultiRoleTest_scanStartHandler(UArg arg)
  * @return  bool
  */
 
-static bool isRUThNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent_a) {
+static bool RUTh_isRUThNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent_a) {
 	uint8 index = 0;
 
 	if (gapDeviceInfoEvent_a->eventType == GAP_ADRPT_ADV_SCAN_IND |
@@ -710,7 +735,7 @@ static bool isRUThNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent_a) {
 			if (gapDeviceInfoEvent_a->pEvtData[index + 1]
 					== GAP_ADTYPE_LOCAL_NAME_COMPLETE) { // found the name
 
-				if (memcomp(&(gapDeviceInfoEvent_a->pEvtData[index + 2]),&(advertData[2]),(gapDeviceInfoEvent_a->pEvtData[index]) - 1) == 0) { //it's a compatible name
+				if (memcomp(&(gapDeviceInfoEvent_a->pEvtData[index + 2]),&(advertData[2]),(gapDeviceInfoEvent_a->pEvtData[index]) - 1)) { //it's a compatible name
 
 					return TRUE;
 
@@ -736,9 +761,321 @@ static uint8 memcomp(uint8 * str1, uint8 * str2, uint8 len) {
 	uint8 index;
 	for (index = 0; index < len; index++) {
 		if (str1[index] != str2[index]) {
-			return 1;
+			return 0;
 		}
 	}
-	return 0;
+	return 1;
 }
 
+/*********************************************************************
+ * @fn      RUTh_addNode
+ *
+ * @brief	Adds a node at the end of the neighbor list with informations contained in the gap info event.
+ * It automatically manages the adding of first node which is critical because it is referenced by
+ * neighborListHeadPtr
+ *
+ * @return  The pointer to the node istance inside the list
+ */
+static listNode_t* RUTh_addNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent) {
+
+	listNode_t* new_Node_Ptr = (listNode_t*) ICall_malloc(sizeof(listNode_t));
+
+	if (new_Node_Ptr == NULL) {
+		//malloc fail!
+		PIN_setOutputValue(hGpioPin, Board_LED1, Board_LED_ON);
+		PIN_setOutputValue(hGpioPin, Board_LED2, Board_LED_ON);
+		return NULL;
+	}
+
+	//set up the data for the new node
+	new_Node_Ptr->device.rssi = gapDeviceInfoEvent->rssi;
+	new_Node_Ptr->device.lastContactTicks = Clock_getTicks();
+	new_Node_Ptr->device.advDataLen = gapDeviceInfoEvent->dataLen;
+
+	memcpy(new_Node_Ptr->device.mac, gapDeviceInfoEvent->addr, B_ADDR_LEN);
+	memcpy(new_Node_Ptr->device.advData, &gapDeviceInfoEvent->pEvtData[0], gapDeviceInfoEvent->dataLen);
+
+	new_Node_Ptr->next = NULL; // we put the new node at the back of the list
+
+	// add the new node at the end of the list
+	if(neighborListHeadPtr != NULL){
+		listNode_t* node = neighborListHeadPtr;
+		while (node->next != NULL){
+			node = node->next;
+		}
+		node->next = new_Node_Ptr;
+	}
+	else{
+		neighborListHeadPtr = new_Node_Ptr;
+	}
+
+	// if we're adding this new guy, he's also the most recently discovered, so we need to add him to that other list, too
+	RUTh_addMostRecentNode(gapDeviceInfoEvent);
+
+	return new_Node_Ptr;
+}
+
+/*********************************************************************
+ * @fn      RUTh_addMostRecentNode
+ *
+ * @brief	Maintains a list of the most recent nodes seen, limited by a constant RECENT_LIST_MAX_SIZE
+ *
+ * @return  The pointer to the node istance inside the list
+ */
+static listNode_t* RUTh_addMostRecentNode(gapDeviceInfoEvent_t *gapDeviceInfoEvent) {
+
+	listNode_t* new_Node_for_Recents_Ptr = (listNode_t*) ICall_malloc(sizeof(listNode_t));
+
+	if (new_Node_for_Recents_Ptr == NULL) {
+		//malloc fail!
+		PIN_setOutputValue(hGpioPin, Board_LED1, Board_LED_ON);
+		PIN_setOutputValue(hGpioPin, Board_LED2, Board_LED_ON);
+		return NULL;
+	}
+
+	//set up the data for the new node
+	new_Node_for_Recents_Ptr->device.rssi = gapDeviceInfoEvent->rssi;
+	new_Node_for_Recents_Ptr->device.lastContactTicks = Clock_getTicks();
+	new_Node_for_Recents_Ptr->device.advDataLen = gapDeviceInfoEvent->dataLen;
+
+	memcpy(new_Node_for_Recents_Ptr->device.mac, gapDeviceInfoEvent->addr, B_ADDR_LEN);
+	memcpy(new_Node_for_Recents_Ptr->device.advData, &gapDeviceInfoEvent->pEvtData[0], gapDeviceInfoEvent->dataLen);
+
+	// since we're adding this guy, he's one of the three most recent. So we update that list
+	new_Node_for_Recents_Ptr->next = mostRecentNeighborsPtr;
+	mostRecentNeighborsPtr = new_Node_for_Recents_Ptr;
+
+	//if this list is longer than its limit, then we need to drop whoever's at the end...
+	listNode_t* node = mostRecentNeighborsPtr;
+	uint8 index = 1;
+	while(node != NULL && index != RECENT_LIST_MAX_SIZE){
+		node = node->next;
+		index++;
+	}
+	// node is pointing to either NULL or the node that should be the last one.
+	// if node is not null and node->next is not null, we need to deallocate node->next and set node->next to null.
+	if(node != NULL){
+		if(node->next != NULL){
+			ICall_free(node->next);
+			node->next = NULL;
+		}
+	}
+
+	return new_Node_for_Recents_Ptr;
+}
+
+
+/*********************************************************************
+ * @fn      RUTh_isInNeighorList
+ *
+ * @brief	Checks whether the device referenced in the gapDeviceInfoEvent is already a known neighbor
+ *
+ * @return  true if the reference node is in the list; false otherwise
+ */
+static bool RUTh_isInNeighborList(gapDeviceInfoEvent_t *gapDeviceInfoEvent) {
+	bool toReturn = false;
+	if(neighborListHeadPtr != NULL){
+		listNode_t* node = neighborListHeadPtr;
+		while(node != NULL){
+			if(memcomp(node->device.mac, gapDeviceInfoEvent->addr, B_ADDR_LEN)){
+				toReturn = true;
+				break;
+			}
+			node = node->next;
+		}
+	}
+	return toReturn;
+}
+
+/*********************************************************************
+ * @fn      RUTh_removeFromRecentsList
+ *
+ * @brief	Checks whether the device referenced in the gapDeviceInfoEvent is one of the recent
+ *          neighbors and if so, deletes it.
+ *
+ * @return  true if the reference node was in the list and was deleted; false otherwise
+ */
+static bool RUTh_removeFromRecentList(gapDeviceInfoEvent_t *gapDeviceInfoEvent) {
+	bool toReturn = false;
+	if(mostRecentNeighborsPtr != NULL){
+		// if the first one is the match, it's a special case...
+		if(memcomp(mostRecentNeighborsPtr->device.mac, gapDeviceInfoEvent->addr, B_ADDR_LEN)){
+			toReturn = true;
+			listNode_t* nodeToDelete = mostRecentNeighborsPtr;
+			mostRecentNeighborsPtr = nodeToDelete->next;
+			ICall_free(nodeToDelete);
+		}
+		else{
+			listNode_t* node = mostRecentNeighborsPtr;
+			while(node->next != NULL){
+				if(memcomp(node->next->device.mac, gapDeviceInfoEvent->addr, B_ADDR_LEN)){
+					toReturn = true;
+					listNode_t* nodeToDelete = node->next;
+					node->next = nodeToDelete->next;
+					ICall_free(nodeToDelete);
+					break;
+				}
+				node = node->next;
+			}
+		}
+	}
+	return toReturn;
+}
+
+/*********************************************************************
+ * @fn      RUTh_getNeighbor
+ *
+ * @brief	uses a bt mac address to find a stored neighbor node
+ *
+ * @return  a pointer to a node if it exists in the list
+ */
+static listNode_t* RUTh_getNeighbor(uint8 *addr) {
+	if(neighborListHeadPtr != NULL){
+		listNode_t* node = neighborListHeadPtr;
+		while(node != NULL){
+			if(memcomp(node->device.mac, addr, B_ADDR_LEN)){
+				return node;
+			}
+			node = node->next;
+		}
+	}
+	return NULL;
+}
+
+/*********************************************************************
+ * @fn      RUTh_countNeighbors
+ *
+ * @brief	Counts the number of discovered neighbors
+ *
+ * @return  the number of nodes in the neighborlist
+ */
+static uint8 RUTh_countNeighbors(){
+	uint8 toReturn = 0;
+	listNode_t* node = neighborListHeadPtr;
+	while(node != NULL){
+		toReturn++;
+		node = node->next;
+	}
+	return toReturn;
+}
+
+/*********************************************************************
+ * @fn      RUTh_updateDiscoveryTime
+ *
+ * @brief	updates the discovery time of an already known neighbor
+ *
+ */
+static void RUTh_updateDiscoveryTime(gapDeviceInfoEvent_t *gapDeviceInfoEvent){
+	listNode_t* node = RUTh_getNeighbor(gapDeviceInfoEvent->addr);
+	if(node != NULL){
+		node->device.lastContactTicks = Clock_getTicks();
+	}
+	// if I updated the discovery time to now, this node is now one of the most recent ones.
+	// so I need to update that data structure too.
+	// first, it's possible that this node is already in that list. We wouldn't want it there twice.
+	// remove it if its there
+	RUTh_removeFromRecentList(gapDeviceInfoEvent);
+	// then add the updated info
+	RUTh_addMostRecentNode(gapDeviceInfoEvent);
+}
+
+static void RUTh_updateAdvertData(){
+	uint8 newAdvertData[31];
+	uint8 numNeighbors;
+	uint8 index;
+
+
+	newAdvertData[0] = advertData[0];
+	newAdvertData[1] = advertData[1];
+	newAdvertData[2] = advertData[2];
+	newAdvertData[3] = advertData[3];
+	newAdvertData[4] = advertData[4];
+	newAdvertData[5] = advertData[5];
+	newAdvertData[6] = advertData[6];
+	newAdvertData[7] = advertData[7];
+	newAdvertData[8] = advertData[8];
+	newAdvertData[9] = advertData[9];
+
+	//newAdvertData[10] -- needs to be length of the RUTh application data. set it later.
+
+	numNeighbors = RUTh_countNeighbors();
+
+	newAdvertData[11] = numNeighbors;
+
+	if(numNeighbors >= RECENT_LIST_MAX_SIZE){
+		newAdvertData[12] = RECENT_LIST_MAX_SIZE;
+	}
+	else{
+		newAdvertData[12] = numNeighbors;
+	}
+
+	index = 13;
+	listNode_t* node = mostRecentNeighborsPtr;
+	while(node != NULL){
+		uint8 i = 0;
+		while(i < B_ADDR_LEN){
+			newAdvertData[index++] = node->device.mac[i++];
+		}
+		node = node->next;
+	}
+	// the last byte we filled is (index - 1); the size of the data is index - 11
+	newAdvertData[10] = (index - 11);
+	GAP_UpdateAdvertisingData(selfEntity, true, index, &newAdvertData[0]);
+	System_printf("adv[0]: %d\n", newAdvertData[0]);
+	System_printf("adv[1]: %d\n", newAdvertData[1]);
+	System_printf("adv[2]: %c\n", newAdvertData[2]);
+	System_printf("adv[3]: %c\n", newAdvertData[3]);
+	System_printf("adv[4]: %c\n", newAdvertData[4]);
+	System_printf("adv[5]: %c\n", newAdvertData[5]);
+	System_printf("adv[6]: %d\n", newAdvertData[6]);
+	System_printf("adv[7]: %d\n", newAdvertData[7]);
+	System_printf("adv[8]: %d\n", newAdvertData[8]);
+	System_printf("adv[9]: %d\n", newAdvertData[9]);
+	System_printf("adv[10]: %d\n", newAdvertData[10]);
+	System_printf("adv[11]: %d\n", newAdvertData[11]);
+	System_printf("adv[12]: %d\n", newAdvertData[12]);
+	System_printf("adv[13]: %d\n", newAdvertData[13]);
+	System_printf("adv[14]: %d\n", newAdvertData[14]);
+}
+
+static void RUTh_processAdvertisement(gapMultiRoleEvent_t *pEvent){
+	System_printf("Address: ");
+	System_printf(Util_convertBdAddr2Str(pEvent->deviceInfo.addr));
+	System_printf("\n");
+	if(RUTh_isRUThNode((gapDeviceInfoEvent_t*) &pEvent->deviceInfo)){
+		System_printf("RUTh Node! Adding to list if it's not already there.\n");
+		// add a newly discovered neighbor to the list
+		if(!RUTh_isInNeighborList((gapDeviceInfoEvent_t*) &pEvent->deviceInfo)){
+			RUTh_addNode((gapDeviceInfoEvent_t*) &pEvent->deviceInfo);
+		}
+		// if the neighbor was already known, just update the clockticks
+		else{
+			RUTh_updateDiscoveryTime((gapDeviceInfoEvent_t*) &pEvent->deviceInfo);
+		}
+
+		//Just for fun, let's see what's in the advert data. It should be (from byte 10):
+		// length of app data (one byte)
+		// number of neighbors (one byte)
+		// number of neighbors included (up to three; one byte)
+		// addresses of neighbors (6 bytes each)
+		System_printf("How  much data is there? %x\n", pEvent->deviceInfo.dataLen);
+		//Let's look at some of it
+		System_printf("adv[0]: %d\n", pEvent->deviceInfo.pEvtData[0]);
+		System_printf("adv[1]: %d\n", pEvent->deviceInfo.pEvtData[1]);
+		System_printf("adv[2]: %c\n", pEvent->deviceInfo.pEvtData[2]);
+		System_printf("adv[3]: %c\n", pEvent->deviceInfo.pEvtData[3]);
+		System_printf("adv[4]: %c\n", pEvent->deviceInfo.pEvtData[4]);
+		System_printf("adv[5]: %c\n", pEvent->deviceInfo.pEvtData[5]);
+		System_printf("adv[6]: %d\n", pEvent->deviceInfo.pEvtData[6]);
+		System_printf("adv[7]: %d\n", pEvent->deviceInfo.pEvtData[7]);
+		System_printf("adv[8]: %d\n", pEvent->deviceInfo.pEvtData[8]);
+		System_printf("adv[9]: %d\n", pEvent->deviceInfo.pEvtData[9]);
+		System_printf("adv[10]: %d\n", pEvent->deviceInfo.pEvtData[10]);
+		System_printf("adv[11]: %d\n", pEvent->deviceInfo.pEvtData[11]);
+		System_printf("adv[12]: %d\n", pEvent->deviceInfo.pEvtData[12]);
+		System_printf("adv[13]: %d\n", pEvent->deviceInfo.pEvtData[13]);
+		System_printf("adv[14]: %d\n", pEvent->deviceInfo.pEvtData[14]);
+
+
+	}
+}
